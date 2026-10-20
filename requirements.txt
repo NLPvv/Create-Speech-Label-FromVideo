@@ -1,0 +1,5 @@
+paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+opencv-contrib-python==4.10.0.84
+PyTurboJPEG @ git+https://github.com/lilohuang/PyTurboJPEG.git@ef7660a0e738f49a33d0a144d1e573c7f4eabfcc
+thefuzz==0.22.1
+tqdm==4.67.1
