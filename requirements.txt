@@ -1,5 +1,6 @@
-paddlepaddle-gpu==3.2.2 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+# Install the CPU or GPU PaddlePaddle runtime separately (see README.md).
+paddleocr>=3.2.0,<4.0
 opencv-contrib-python==4.10.0.84
-PyTurboJPEG @ git+https://github.com/lilohuang/PyTurboJPEG.git@ef7660a0e738f49a33d0a144d1e573c7f4eabfcc
+# Optional JPEG acceleration: pip install PyTurboJPEG==1.7.7 (requires libturbojpeg).
 thefuzz==0.22.1
 tqdm==4.67.1

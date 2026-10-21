@@ -1,93 +1,108 @@
-import os
+"""Recognize cropped frame folders, reusing one OCR model per worker."""
+
+import argparse
+import logging
 import multiprocessing as mp
-from queue import Empty
-from ..core.ocr_module import OCRProcessor
-from ..core.subtitle_generator import SubtitleGenerator
+import os
+from pathlib import Path
 
-BASE_DIR = "/mnt/nvme_workspace1/liziwei/ocr/2025_11_12_1920_1080/"
-OUTPUT_DIR = "./output/"
-SAVE_JSON = False
-VERBOSE = True
+from core.ocr_module import OCRProcessor
+from core.subtitle_generator import SubtitleGenerator
 
-GPUS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
-HPI = True
-BATCH_SIZE = 10
-SCORE = 0.9
+LOGGER = logging.getLogger(__name__)
 
 
-def gpu_worker(task_queue, gpu_id):
-    
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    device = "gpu:0"
-
-    print(f"----------[Worker GPU {gpu_id}] Start-----------")
-
+def gpu_worker(task_queue, gpu_id, args):
+    # CUDA visibility must be set before Paddle is imported by the lazy loader.
+    if gpu_id is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    device = "gpu:0" if gpu_id is not None else args.device
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(processName)s %(levelname)s: %(message)s")
+    ocrer = OCRProcessor(
+        input_dir="", device=device, enable_hpi=args.hpi,
+        batch_size=args.batch_size, score=args.score, save_json=args.save_json,
+        verbose=args.verbose, model_name=args.model_name,
+    )
+    failed = False
     while True:
-        try:
-            crop_dir_path = task_queue.get_nowait()
-        except Empty:
+        # A blocking get plus sentinels avoids Queue feeder/get_nowait races.
+        folder = task_queue.get()
+        if folder is None:
             break
+        folder = Path(folder)
+        name = folder.name[:-len(args.suffix)] if args.suffix else folder.name
+        name = name or folder.name
+        try:
+            results = ocrer.run(str(folder), str(args.output_dir / "json" / name))
+            if not results:
+                LOGGER.warning("No text passed the confidence threshold: %s", folder)
+            SubtitleGenerator(
+                results, fps=args.fps, sim_threshold=args.sim_threshold,
+                max_gap_frames=args.max_gap_frames,
+            ).generate_srt(str(args.output_dir / f"{name}.srt"))
+        except Exception:
+            failed = True
+            LOGGER.exception("Failed to process %s on %s", folder, device)
+    if failed:
+        raise SystemExit(1)
 
-        folder_name = os.path.basename(crop_dir_path)
-        base_name = folder_name.replace("_crop", "")
-        srt_path = f"2025_11_12_1920_1080/{base_name}.srt"
 
-        print(f"\n----- {crop_dir_path}: {device} -----")
+def build_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("base_dir", type=Path)
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument("--suffix", default="_crop", help="Input folder suffix; empty string selects all folders")
+    parser.add_argument("--gpus", type=int, nargs="+", help="GPU IDs; one process/model per GPU")
+    parser.add_argument("--device", default="cpu", help="Device for a single worker when --gpus is omitted")
+    parser.add_argument("--fps", type=float, default=25)
+    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--score", type=float, default=0.9)
+    parser.add_argument("--sim-threshold", type=float, default=80)
+    parser.add_argument("--max-gap-frames", type=int, default=1)
+    parser.add_argument("--model-name", default="PP-OCRv5_server_rec")
+    parser.add_argument("--hpi", action="store_true")
+    parser.add_argument("--save-json", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    return parser
 
-        # 1. OCR
-        ocrer = OCRProcessor(
-            input_dir=crop_dir_path,
-            output_dir=OUTPUT_DIR,
-            device=device,
-            enable_hpi=HPI,
-            batch_size=BATCH_SIZE,
-            score=SCORE,
-            save_json=SAVE_JSON,
-            verbose=VERBOSE
-        )
-        ocr_results = ocrer.run()
 
-        # 2. SRT
-        sub = SubtitleGenerator(
-            ocr_results,
-            fps=25,
-            sim_threshold=70
-        )
-        sub.generate_srt(srt_path)
-
-        print(f"[GPU {gpu_id}]  -----→ {srt_path}")
-
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.base_dir.is_dir():
+        parser.error(f"Input directory does not exist: {args.base_dir}")
+    if args.gpus and (any(gpu < 0 for gpu in args.gpus) or len(set(args.gpus)) != len(args.gpus)):
+        parser.error("GPU IDs must be nonnegative and unique")
+    try:
+        OCRProcessor("", batch_size=args.batch_size, score=args.score,
+                     device=args.device, model_name=args.model_name)
+        SubtitleGenerator([], fps=args.fps, sim_threshold=args.sim_threshold,
+                          max_gap_frames=args.max_gap_frames)
+    except ValueError as exc:
+        parser.error(str(exc))
+    folders = sorted(path for path in args.base_dir.iterdir()
+                     if path.is_dir() and path.name.endswith(args.suffix)
+                     and path.resolve() != args.output_dir.resolve())
+    if not folders:
+        parser.error(f"No input folders ending with {args.suffix!r} in {args.base_dir}")
+    workers = (args.gpus or [None])[:len(folders)]
+    context = mp.get_context("spawn")
+    task_queue = context.Queue()
+    for folder in folders:
+        task_queue.put(str(folder))
+    for _ in workers:
+        task_queue.put(None)
+    processes = [context.Process(target=gpu_worker, args=(task_queue, gpu, args)) for gpu in workers]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join()
+    return int(any(process.exitcode != 0 for process in processes))
 
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-
-    folders = sorted([
-        os.path.join(BASE_DIR, f)
-        for f in os.listdir(BASE_DIR)
-        if f.endswith("_crop") and os.path.isdir(os.path.join(BASE_DIR, f))
-    ])
-
-    if not folders:
-        exit(0)
-
-    for f in folders:
-        print(" -", f)
-
-    
-    task_queue = mp.Queue()
-    for f in folders:
-        task_queue.put(f)
-
-
-    processes = []
-    for gpu_id in GPUS:
-        p = mp.Process(target=gpu_worker, args=(task_queue, gpu_id))
-        p.start()
-        processes.append(p)
-
-    for p in processes:
-        p.join()
+    raise SystemExit(main())
 
 
 
